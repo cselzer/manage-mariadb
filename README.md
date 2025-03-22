@@ -122,10 +122,9 @@ sudo manage-mariadb update
 
 ## Requirements
 
-- Debian or Ubuntu-based system
+- Debian 12 (Bookworm) or higher (including Raspberry Pi OS based on Debian 12)
 - Root/sudo privileges
-- Internet access (for SSL + updates)
-- A fully-qualified domain name (FQDN) pointing to the server’s public IP
+- Hostname resolving to the server's public IP (e.g., `dbserver.example.com`)
 
 ---
 
