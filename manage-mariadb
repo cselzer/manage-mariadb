@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+#
+# manage-mariadb - MariaDB server management and configuration utility
+# 
+# Copyright (c) 2025 Cody Selzer <cody@cselzer.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+exec > >(tee -a /var/log/mariadb-management.log) 2>&1
+
+# ----- Utility functions -----
+aptwait() {
+  while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do
+    echo -en "\rdpkg locked by another process. waiting."
+    sleep 1
+  done
+}
+
+log_info() { echo -e "\e[1;34m[INFO]\e[0m $*"; }
+log_error() { echo -e "\e[1;31m[ERROR]\e[0m $*" >&2; }
+
+ensure_packages() {
+  for pkg in "$@"; do
+    if ! dpkg -s "$pkg" &> /dev/null; then
+      log_info "Installing $pkg..."
+      aptwait && apt-get update
+      aptwait && apt-get install -y "$pkg"
+    fi
+  done
+}
+
+update_mariadb_config() {
+  local CONF_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
+  local key="$1"
+  local value="$2"
+  
+  # Remove existing setting if any
+  sed -i "/^$key/d" "$CONF_FILE" 2>/dev/null || true
+  
+  # Add the new setting
+  if [[ -n "$value" ]]; then
+    echo "$key = $value" >> "$CONF_FILE"
+  fi
+}
+
+restart_mariadb() {
+  log_info "Restarting MariaDB to apply configuration changes..."
+  systemctl restart mariadb
+}
+
+# Function to generate secure random passwords
+generate_password() {
+  openssl rand -base64 33 | head -32 #strip the equal sign
+}
+
+# ----- SSL functions -----
+setup_ssl_env() {
+  ensure_packages certbot
+  DOMAIN=$(hostname -f)
+  SSL_DIR="/etc/mysql/ssl"
+  CERTBOT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+  mkdir -p "$SSL_DIR"
+  return 0
+}
+
+copy_certs_to_mariadb() {
+  if [[ ! -d "$CERTBOT_DIR" ]]; then
+    log_error "Failed to find certificates at $CERTBOT_DIR"
+    return 1
+  fi
+  
+  log_info "Checking SSL certificates..."
+  local files_changed=0
+  local src_files=("$CERTBOT_DIR/cert.pem" "$CERTBOT_DIR/privkey.pem" "$CERTBOT_DIR/chain.pem")
+  local dst_files=("$SSL_DIR/server-cert.pem" "$SSL_DIR/server-key.pem" "$SSL_DIR/ca-cert.pem")
+  
+  for i in {0..2}; do
+    # Check if destination file exists
+    if [[ ! -f "${dst_files[$i]}" ]]; then
+      log_info "Certificate file ${dst_files[$i]} doesn't exist, will copy"
+      files_changed=1
+      break
+    fi
+    
+    # Compare files using SHA-256 checksum
+    if ! cmp -s "${src_files[$i]}" "${dst_files[$i]}"; then
+      log_info "Certificate ${dst_files[$i]} has changed, will update"
+      files_changed=1
+      break
+    fi
+  done
+  
+  if [[ $files_changed -eq 1 ]]; then
+    log_info "Copying certificates to MySQL SSL directory..."
+    cp "$CERTBOT_DIR/cert.pem" "$SSL_DIR/server-cert.pem"
+    cp "$CERTBOT_DIR/privkey.pem" "$SSL_DIR/server-key.pem"
+    cp "$CERTBOT_DIR/chain.pem" "$SSL_DIR/ca-cert.pem"
+    
+    # Set permissions
+    chown mysql:mysql "$SSL_DIR"/*.pem
+    chmod 600 "$SSL_DIR"/*.pem
+    
+    log_info "Certificates updated"
+    return 2  # Return code 2 means certificates were updated
+  else
+    log_info "Certificates are already up to date, no changes needed"
+    return 0  # Return code 0 means no changes were needed
+  fi
+}
+
+configure_ssl_settings() {
+  local CONF_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
+  sed -i '/^ssl-/d' "$CONF_FILE" 2>/dev/null || true
+  
+  cat <<EOF >> "$CONF_FILE"
+
+# SSL configuration
+ssl-ca = $SSL_DIR/ca-cert.pem
+ssl-cert = $SSL_DIR/server-cert.pem
+ssl-key = $SSL_DIR/server-key.pem
+EOF
+}
+
+verify_hostname() {
+  log_info "Verifying hostname configuration..."
+  
+  # Check that hostname is not localhost
+  HOSTNAME=$(hostname -f)
+  if [[ "$HOSTNAME" == "localhost" || "$HOSTNAME" == "localhost.localdomain" ]]; then
+    log_error "Hostname is set to localhost, which cannot be used for SSL certificates."
+    log_error "Please set a proper hostname with: hostnamectl set-hostname your-server-name.example.com"
+    return 1
+  fi
+  
+  # Ensure dig is installed
+  ensure_packages dnsutils
+  
+  # Check that hostname resolves to an IP via DNS (not just local hosts file)
+  HOST_IP=$(dig +short "$HOSTNAME" A | head -n1)
+  if [[ -z "$HOST_IP" ]]; then
+    log_error "Hostname '$HOSTNAME' does not resolve to any IP address in DNS."
+    log_error "Please add a proper DNS A record for this hostname."
+    return 1
+  fi
+  
+  # Check that the resolved IP is one of the server's IPs
+  SERVER_IPS=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1')
+  if ! echo "$SERVER_IPS" | grep -q "$HOST_IP"; then
+    log_error "Hostname '$HOSTNAME' resolves to $HOST_IP in DNS, which is not one of this server's IPs:"
+    log_error "$SERVER_IPS"
+    log_error "Please update DNS records to point to one of these IPs."
+    return 1
+  fi
+  
+  log_info "Hostname '$HOSTNAME' correctly resolves to $HOST_IP in DNS"
+  return 0
+}
+
+mariadb_install_ssl() {
+  log_info "Installing SSL certificates for MariaDB using certbot standalone..."
+  
+  # Verify hostname before proceeding
+  if ! verify_hostname; then
+    log_error "Cannot install SSL certificates due to hostname configuration issues."
+    exit 1
+  fi
+  
+  setup_ssl_env
+  
+  log_info "Using domain: $DOMAIN"
+  
+  # Run certbot in standalone mode
+  log_info "Requesting certificate from Let's Encrypt..."
+  certbot certonly --standalone --non-interactive --agree-tos \
+    --email "admin@${DOMAIN}" --domain "${DOMAIN}" \
+    --cert-name "${DOMAIN}" --keep-until-expiring
+  
+  # Copy and configure certificates
+  if copy_certs_to_mariadb; then
+    configure_ssl_settings
+    log_info "SSL certificates installed and MariaDB configured to use them."
+    
+    # Install the renewal hook
+    install_renewal_hook
+  else
+    exit 1
+  fi
+}
+
+renew_ssl() {
+  log_info "Checking for updated SSL certificates..."
+  
+  setup_ssl_env
+  
+  # Check if certificates exist in certbot directory
+  if [[ ! -d "$CERTBOT_DIR" ]]; then
+    log_info "No certificates found at $CERTBOT_DIR. Certbot may not have run yet."
+    exit 0
+  fi
+  
+  # Copy certificates and restart only if needed
+  local cert_status
+  copy_certs_to_mariadb
+  cert_status=$?
+  
+  if [[ $cert_status -eq 1 ]]; then
+    # Error occurred
+    log_error "Failed to process certificates."
+    exit 1
+  elif [[ $cert_status -eq 2 ]]; then
+    # Certificates were updated, restart MariaDB
+    log_info "Certificates were updated, restarting MariaDB..."
+    restart_mariadb
+    log_info "SSL certificates updated successfully."
+  else
+    # No changes were needed
+    log_info "SSL certificates are already up to date, no changes required."
+  fi
+}
+
+# Function to install the renewal hook
+install_renewal_hook() {
+  log_info "Installing Let's Encrypt renewal hook for MariaDB..."
+  
+  # Create hooks directory if it doesn't exist
+  mkdir -p "/etc/letsencrypt/renewal-hooks/post"
+  
+  # Create the renewal hook script
+  echo '#!/bin/bash
+/usr/sbin/manage-mariadb renew-ssl' > "/etc/letsencrypt/renewal-hooks/post/mariadb.sh"
+  
+  # Make the script executable
+  chmod +x "/etc/letsencrypt/renewal-hooks/post/mariadb.sh"
+  
+  log_info "Renewal hook installed at /etc/letsencrypt/renewal-hooks/post/mariadb.sh"
+}
+
+# ----- Configuration functions -----
+toggle_force_ssl() {
+  log_info "Checking current SSL requirement status..."
+  
+  local CONF_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
+  local current_setting=$(grep -e "^require_secure_transport" "$CONF_FILE" | awk '{print $3}')
+  
+  if [[ "${current_setting,,}" == "on" ]]; then
+    log_info "SSL is currently required. Disabling requirement..."
+    update_mariadb_config "require_secure_transport" "OFF"
+  else
+    log_info "SSL is currently optional. Enabling requirement..."
+    update_mariadb_config "require_secure_transport" "ON"
+  fi
+  
+  restart_mariadb
+  
+  # Verify and report new state
+  current_setting=$(grep -e "^require_secure_transport" "$CONF_FILE" | awk '{print $3}')
+  if [[ "${current_setting,,}" == "on" ]]; then
+    log_info "All connections to MariaDB now REQUIRE SSL/TLS"
+  else
+    log_info "Connections to MariaDB can use SSL/TLS but it is NOT required"
+  fi
+}
+
+configure_mariadb() {
+  ensure_packages mariadb-server
+  
+  if [[ -f /root/.my.cnf ]]; then
+    rm /root/.my.cnf 
+  fi
+  
+  mariadb_install_ssl
+  
+  log_info "stopping mariadb..."
+  systemctl stop mariadb
+  
+  log_info "starting mariadb with --skip-grant-tables"
+  systemctl set-environment MYSQLD_OPTS="--skip-grant-tables --skip-networking"
+  systemctl start mariadb
+  
+  MARIADB_ROOT_PASSWORD=$(generate_password)
+  
+  mariadb -v -u root -e "FLUSH PRIVILEGES; ALTER USER 'root'@'localhost' IDENTIFIED BY '${MARIADB_ROOT_PASSWORD}';"
+  
+  log_info "stopping mariadb with --skip-grant-tables"
+  systemctl stop mariadb
+  systemctl unset-environment MYSQLD_OPTS
+  
+  log_info "starting mariadb without --skip-grant-tables"
+  systemctl restart mariadb
+  printf "[client]\nuser=root\npassword=\"%s\"\n" "$MARIADB_ROOT_PASSWORD" > /root/.my.cnf
+  chmod 400 /root/.my.cnf
+  log_info "Root password set successfully"
+  log_info "Saved root credentials to /root/.my.cnf"
+  
+  unset MARIADB_ROOT_PASSWORD
+}
+
+# ----- Remote access functions -----
+
+toggle_remote_access() {
+  local CONF_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
+  local current_bind=$(grep -e "^bind-address" "$CONF_FILE" | awk '{print $3}')
+  
+  if [[ "$current_bind" == "127.0.0.1" || -z "$current_bind" ]]; then
+    log_info "Enabling remote access to MariaDB..."
+    sed -i '/^bind-address/d' "$CONF_FILE"
+    sed -i '/^skip-networking/d' "$CONF_FILE"
+    sed -i '/\[mysqld\]/a bind-address = 0.0.0.0' "$CONF_FILE"
+  else
+    log_info "Disabling remote access to MariaDB..."
+    sed -i '/^bind-address/d' "$CONF_FILE"
+    sed -i '/\[mysqld\]/a bind-address = 127.0.0.1' "$CONF_FILE"
+  fi
+  
+  restart_mariadb
+  
+  # Report new state
+  current_bind=$(grep -e "^bind-address" "$CONF_FILE" | awk '{print $3}')
+  if [[ "$current_bind" == "0.0.0.0" ]]; then
+    log_info "Remote access is now ENABLED"
+  else
+    log_info "Remote access is now DISABLED"
+  fi
+}
+
+# ----- User management functions -----
+show_help_users() {
+  echo "Usage: $0 users <command> [username]"
+  echo ""
+  echo "Commands:"
+  echo "  create <username>   Create a new MariaDB user and database with a random password"
+  echo "  reset  <username>   Reset the password for an existing user"
+  echo "  drop   <username>   Drop a user and its associated database (use --force to skip confirmation)"
+  echo "  list                List all MariaDB users"
+  echo "  grants <username>   Show grants for a specific user"
+  echo "  help                Show this help message"
+}
+
+create_user() {
+  local username="$1"
+  local password
+  password=$(generate_password)
+  
+  log_info "Creating user '$username' and database '$username'..."
+  
+  mariadb -u root <<EOF
+CREATE DATABASE IF NOT EXISTS \`$username\`;
+CREATE USER IF NOT EXISTS '$username'@'%' IDENTIFIED BY '$password';
+GRANT ALL PRIVILEGES ON \`$username\`.* TO '$username'@'%';
+FLUSH PRIVILEGES;
+EOF
+  
+  log_info "User '$username' created with access to database '$username'."
+  log_info "Generated password: $password"
+}
+
+reset_password() {
+  local username="$1"
+  local new_password
+  new_password=$(generate_password)
+  
+  log_info "Resetting password for user '$username'..."
+  
+  mariadb -u root <<EOF
+ALTER USER '$username'@'%' IDENTIFIED BY '$new_password';
+FLUSH PRIVILEGES;
+EOF
+  
+  log_info "Password reset for '$username'."
+  log_info "New password: $new_password"
+}
+
+list_users() {
+  log_info "Listing MariaDB users:"
+  mariadb -u root -e "SELECT User, Host FROM mysql.global_priv ORDER BY User, Host;"
+}
+
+show_grants() {
+  local username="$1"
+  
+  log_info "Showing grants for user '$username':"
+  mariadb -u root -e "SHOW GRANTS FOR '$username'@'%';"
+}
+
+drop_user() {
+  local username="$1"
+  local force="${2:-}"
+  
+  log_info "Preparing to drop user '$username' and database '$username'..."
+  
+  # Confirm unless --force is passed
+  if [[ "$force" != "--force" ]]; then
+    read -p "Are you sure you want to drop user '$username' and database '$username'? This cannot be undone. [y/N] " confirm
+    if [[ "${confirm,,}" != "y" ]]; then
+      log_info "Operation cancelled."
+      return 0
+    fi
+  fi
+  
+  log_info "Dropping database and user '$username'..."
+  
+  mariadb -u root <<EOF
+DROP DATABASE IF EXISTS \`$username\`;
+DROP USER IF EXISTS '$username'@'%';
+FLUSH PRIVILEGES;
+EOF
+  
+  log_info "User '$username' and database '$username' have been dropped."
+}
+
+manage_mariadb_users() {
+  if [[ $# -lt 1 ]]; then
+    show_help_users
+    return 1
+  fi
+  
+  local command="$1"
+  local username="${2:-}"
+  local force="${3:-}"
+  
+  case "$command" in
+    create)
+      if [[ -z "${username:-}" ]]; then
+        log_error "Username required for 'create' command."
+        return 1
+      fi
+      create_user "$username"
+      ;;
+    reset)
+      if [[ -z "${username:-}" ]]; then
+        log_error "Username required for 'reset' command."
+        return 1
+      fi
+      reset_password "$username"
+      ;;
+    drop)
+      if [[ -z "${username:-}" ]]; then
+        log_error "Username required for 'drop' command."
+        return 1
+      fi
+      drop_user "$username" "$force"
+      ;;
+    list)
+      list_users
+      ;;
+    grants)
+      if [[ -z "${username:-}" ]]; then
+        log_error "Username required for 'grants' command."
+        return 1
+      fi
+      show_grants "$username"
+      ;;
+    help|--help|-h)
+      show_help_users
+      ;;
+    *)
+      log_error "Unknown command: $command"
+      show_help_users
+      return 1
+      ;;
+  esac
+}
+
+# ----- Update function -----
+update_script() {
+  local SCRIPT_URL="https://raw.githubusercontent.com/cselzer/manage-mariadb/refs/heads/main/manage-mariadb"
+  local CURRENT_SCRIPT="${BASH_SOURCE[0]}"
+  
+  log_info "Checking for updates..."
+  
+  # Create a temporary file
+  local TEMP_FILE=$(mktemp)
+  
+  # Download the latest version
+  if ! curl -sS "$SCRIPT_URL" -o "$TEMP_FILE"; then
+    log_error "Failed to download the latest version."
+    rm "$TEMP_FILE"
+    return 1
+  fi
+  
+  # Check if the download was successful and contains actual content
+  if [[ ! -s "$TEMP_FILE" ]]; then
+    log_error "Downloaded file is empty. Update failed."
+    rm "$TEMP_FILE"
+    return 1
+  fi
+  
+  # Compare with current version
+  if cmp -s "$TEMP_FILE" "$CURRENT_SCRIPT"; then
+    log_info "You already have the latest version."
+    rm "$TEMP_FILE"
+    return 0
+  fi
+  
+  # Make a backup of the current script
+  local BACKUP_FILE="${CURRENT_SCRIPT}.backup"
+  log_info "Creating backup at ${BACKUP_FILE}"
+  cp "$CURRENT_SCRIPT" "$BACKUP_FILE"
+  
+  # Replace current script with the new version
+  cat "$TEMP_FILE" > "$CURRENT_SCRIPT"
+  chmod +x "$CURRENT_SCRIPT"
+  
+  log_info "Script updated successfully. Previous version saved to ${BACKUP_FILE}"
+  rm "$TEMP_FILE"
+  
+  log_info "Please run the script again to use the updated version."
+  exit 0
+}
+
+# ----- Main function -----
+main() {
+  case "${1:-}" in
+    configure)
+      configure_mariadb
+      ;;
+    users)
+      manage_mariadb_users "${@:2}"
+      ;;
+    renew-ssl)
+      renew_ssl
+      ;;
+    toggle-remote)
+      toggle_remote_access
+      ;;
+    toggle-force-ssl)
+      toggle_force_ssl
+      ;;
+    install-renewal-hook)
+      install_renewal_hook
+      ;;
+    update)
+      update_script
+      ;;
+    *)
+      log_info "Usage: $0 [configure|users|renew-ssl|toggle-remote|toggle-force-ssl|install-renewal-hook|update]"
+      log_info "  configure - Install and configure MariaDB with SSL"
+      log_info "  users - Manage MariaDB users"
+      log_info "  renew-ssl - Renew SSL certificates and update MariaDB"
+      log_info "  toggle-remote - Toggle remote access on/off"
+      log_info "  toggle-force-ssl - Toggle whether SSL is required for all connections"
+      log_info "  install-renewal-hook - Install automatic renewal hook for Let's Encrypt certificates"
+      log_info "  update - Update script to the latest version from GitHub"
+      log_info ""
+      log_info "For user management options, run: $0 users help"
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
